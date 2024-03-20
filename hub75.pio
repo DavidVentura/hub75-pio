@@ -1,0 +1,45 @@
+.program data
+
+.side_set 2 ; [OE, LATCH]
+
+; set pindirs, 1 ;  1?
+
+; expected data format = 1 [6 data bits] 0
+;                        ^ clk up
+;                                        ^ clk down
+out x, 8 	side 0x2
+mov isr, x 	side 0x2
+.wrap_target
+	; yoink the first byte, store in ISR??
+	mov x, isr 	side 0x2 
+	set y, 16 	side 0x2 ; per-half-panel height
+	pixel_out:
+		; mb out a 0/1 from y/null? save 2 bits
+		out pins, 1 side 0x2 		; clk up
+		out pins, 6 side 0x2 		; shift out r1g1b1 r2g2b2
+		out pins, 1 side 0x2 		; clk down
+		jmp x-- pixel_out side 0x2 	; if row is not done, output more pixel
+	row_done:
+		nop side 0x1 				; oe=0; latch=1
+		nop side 0x2 				; oe=1; latch=0
+		jmp y-- pixel_out side 0x2 	; if screen is not done, output more pixels
+		irq set 2 side 0x2 			; notify other SM that row is done
+		irq wait 3 side 0x2 		; wait for addr/latch to be done
+
+	irq wait 1 side 0x0 	; wait for next screen to be ready
+							; disable OE to avoid having 1 row be
+							; much brighter than the others
+.wrap
+
+
+.program addr
+.wrap_target
+	set y, 16
+	wait_block:
+		irq wait 2
+		mov osr, y ; copy address to OSR
+		; could bit-reverse then dump 28 bits to null?
+		out pins, 4 ; A B C D - maybe E?
+		irq set 3
+		jmp y-- wait_block ; keep waiting while y>0
+.wrap
