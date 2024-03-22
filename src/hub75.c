@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -23,6 +24,7 @@
 
 #define WIDTH 64
 #define HEIGHT 32
+#define BITDEPTH 8
 
 #define UART_ID uart0
 #define BAUD_RATE 115200
@@ -47,26 +49,40 @@ int main() {
     hub75_data_rgb888_program_init(pio, sm_data, data_prog_offs, DATA_BASE_PIN, CLK_PIN);
     hub75_row_program_init(pio, sm_row, row_prog_offs, ROWSEL_BASE_PIN, ROWSEL_N_PINS, STROBE_PIN);
 
-    //static uint32_t gc_plane[WIDTH*HEIGHT/8]; // 4 pix per entry; for DMA later
+    static uint32_t gc_plane[8][WIDTH/4*HEIGHT/2]; // 4 pix per entry
 	//though it'd mean an interrupt every <3.2ms
+
+	uint8_t addrs = (1 << ROWSEL_N_PINS);
+	uint8_t quarter_w = WIDTH/4;
+
+
+	for (int bit = 0; bit < BITDEPTH; ++bit) {
+		for (int rowsel = 0; rowsel < addrs; ++rowsel) {
+			for (int x = 0; x < quarter_w; x++) {
+				uint16_t idx = rowsel * WIDTH/4 + x;
+				uint32_t color0 = 0b111111;
+				uint32_t color1 = 0b100100;
+				uint32_t color2 = 0b010010;
+				uint32_t color3 = 0b001001;
+
+				// ((x+0)*4)
+				uint32_t pix =  (color0 <<  0) | // RGBRGB ((x+0, y), (x+0, y+16))
+								(color1 <<  6) | // RGBRGB ((x+1, y), (x+1, y+16))
+								(color2 << 12) | // RGBRGB ((x+2, y), (x+2, y+16))
+								(color3 << 18);  // RGBRGB ((x+3, y), (x+3, y+16))
+												 // 8 bit padding, bits 24-32
+				gc_plane[bit][idx] = pix;
+			}
+		}
+	}
 
     while (1) {
 		absolute_time_t start = get_absolute_time();
-		for (int bit = 0; bit < 8; ++bit) {
-			for (int rowsel = 0; rowsel < (1 << ROWSEL_N_PINS); ++rowsel) {
-				for (int x = 0; x < WIDTH; x+=4) {
-
-					uint32_t color0 = 0b111111;
-					uint32_t color1 = 0b100100;
-					uint32_t color2 = 0b010010;
-					uint32_t color3 = 0b001001;
-					uint32_t pix =  (((x+0)*4) <<  0) | // RGBRGB ((x+0, y), (x+0, y+16))
-									(((x+1)*4) <<  6) | // RGBRGB ((x+1, y), (x+1, y+16))
-									(((x+2)*4) << 12) | // RGBRGB ((x+2, y), (x+2, y+16))
-									(((x+3)*4) << 18);  // RGBRGB ((x+3, y), (x+3, y+16))
-													    // 8 bit padding, bits 24-32
-					// BGRBGRBGRBGRBGRBGR
-					pix = 0b001001010010100100111111 << 0;
+		for (int bit = 0; bit < BITDEPTH; ++bit) {
+			for (int rowsel = 0; rowsel < addrs; ++rowsel) {
+				for (int x = 0; x < quarter_w; x++) {
+					uint16_t idx = rowsel * WIDTH/4 + x;
+					uint32_t pix = gc_plane[bit][idx];
 					pio_sm_put_blocking(pio, sm_data, pix);
 				}
                 // SM is finished when it stalls on empty TX FIFO
