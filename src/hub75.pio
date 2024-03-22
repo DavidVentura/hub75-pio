@@ -1,78 +1,110 @@
-/**
- * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
- *
- * SPDX-License-Identifier: BSD-3-Clause
- */
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
 
-#include <stdio.h>
+.program hub75_row
 
-#include "pico/stdlib.h"
-#include "hardware/gpio.h"
-#include "hardware/pio.h"
-#include "hub75.pio.h"
+; side-set pin 0 is LATCH
+; side-set pin 1 is OEn
+; OUT pins are row select A-E
+;
+; Each FIFO record consists of:
+; - 5-bit row select (LSBs)
+; - Pulse width - 1 (27 MSBs)
+;
+; Repeatedly select a row, pulse LATCH, and generate a pulse of a certain
+; width on OEn.
 
-#include "mountains_128x64_rgb565.h"
+.side_set 2
 
-#define DATA_BASE_PIN 0
-#define DATA_N_PINS 6
-#define ROWSEL_BASE_PIN 6
-#define ROWSEL_N_PINS 5
-#define CLK_PIN 11
-#define STROBE_PIN 12
-#define OEN_PIN 13
+.wrap_target
+    out pins, 5 [7]    side 0x2 ; latch=0; oe=1
+    out x, 27   [7]    side 0x3 ; latch=1; oe=1
+pulse_loop:
+    jmp x-- pulse_loop side 0x0 ; latch=0; oe=0
+.wrap
 
-#define WIDTH 128
-#define HEIGHT 64
+% c-sdk {
+static inline void hub75_row_program_init(PIO pio, uint sm, uint offset, uint row_base_pin, uint n_row_pins, uint latch_base_pin) {
+    pio_sm_set_consecutive_pindirs(pio, sm, row_base_pin, n_row_pins, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, latch_base_pin, 2, true);
+    for (uint i = row_base_pin; i < row_base_pin + n_row_pins; ++i)
+        pio_gpio_init(pio, i);
+    pio_gpio_init(pio, latch_base_pin);
+    pio_gpio_init(pio, latch_base_pin + 1);
 
-static inline uint32_t gamma_correct_565_888(uint16_t pix) {
-    uint32_t r_gamma = pix & 0xf800u;
-    r_gamma *= r_gamma;
-    uint32_t g_gamma = pix & 0x07e0u;
-    g_gamma *= g_gamma;
-    uint32_t b_gamma = pix & 0x001fu;
-    b_gamma *= b_gamma;
-    return (b_gamma >> 2 << 16) | (g_gamma >> 14 << 8) | (r_gamma >> 24 << 0);
+    pio_sm_config c = hub75_row_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, row_base_pin, n_row_pins);
+    sm_config_set_sideset_pins(&c, latch_base_pin);
+    sm_config_set_out_shift(&c, true, true, 32);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
 }
 
-int main() {
-    stdio_init_all();
-
-    PIO pio = pio0;
-    uint sm_data = 0;
-    uint sm_row = 1;
-
-    uint data_prog_offs = pio_add_program(pio, &hub75_data_rgb888_program);
-    uint row_prog_offs = pio_add_program(pio, &hub75_row_program);
-    hub75_data_rgb888_program_init(pio, sm_data, data_prog_offs, DATA_BASE_PIN, CLK_PIN);
-    hub75_row_program_init(pio, sm_row, row_prog_offs, ROWSEL_BASE_PIN, ROWSEL_N_PINS, STROBE_PIN);
-
-    static uint32_t gc_row[2][WIDTH];
-    const uint16_t *img = (const uint16_t*)mountains_128x64;
-
-    while (1) {
-        for (int rowsel = 0; rowsel < (1 << ROWSEL_N_PINS); ++rowsel) {
-            for (int x = 0; x < WIDTH; ++x) {
-                gc_row[0][x] = gamma_correct_565_888(img[rowsel * WIDTH + x]);
-                gc_row[1][x] = gamma_correct_565_888(img[((1u << ROWSEL_N_PINS) + rowsel) * WIDTH + x]);
-            }
-            for (int bit = 0; bit < 8; ++bit) {
-                hub75_data_rgb888_set_shift(pio, sm_data, data_prog_offs, bit);
-                for (int x = 0; x < WIDTH; ++x) {
-                    pio_sm_put_blocking(pio, sm_data, gc_row[0][x]);
-                    pio_sm_put_blocking(pio, sm_data, gc_row[1][x]);
-                }
-                // Dummy pixel per lane
-                pio_sm_put_blocking(pio, sm_data, 0);
-                pio_sm_put_blocking(pio, sm_data, 0);
-                // SM is finished when it stalls on empty TX FIFO
-                hub75_wait_tx_stall(pio, sm_data);
-                // Also check that previous OEn pulse is finished, else things can get out of sequence
-                hub75_wait_tx_stall(pio, sm_row);
-
-                // Latch row data, pulse output enable for new row.
-                pio_sm_put_blocking(pio, sm_row, rowsel | (100u * (1u << bit) << 5));
-            }
-        }
-    }
-
+static inline void hub75_wait_tx_stall(PIO pio, uint sm) {
+    uint32_t txstall_mask = 1u << (PIO_FDEBUG_TXSTALL_LSB + sm);
+    pio->fdebug = txstall_mask;
+    while (!(pio->fdebug & txstall_mask))
+        tight_loop_contents();
 }
+%}
+
+.program hub75_data_rgb888
+.side_set 1
+
+; Each FIFO record consists of 4 RGBRGB values; these are already bit-planed
+
+public entry_point:
+.wrap_target
+public shift0:
+    ; the 4 clock delay prevents some wacky shifting of the last row
+    pull block       [4] side 0 ; 32 bits into OSR
+
+    in osr, 6        [0] side 0 ; 6 lowest OSR bits into ISR
+    out null, 6      [0] side 0 ; shift 6 zeroes into OSR
+    mov pins, isr    [1] side 1 ; col 0 & clock posedge
+
+    in osr, 6        [0] side 0 ;
+    out null, 6      [0] side 0 ; shift 6 zeroes into OSR
+    mov pins, isr    [1] side 1 ; col 1 & clock posedge
+
+    in osr, 6        [0] side 0 ;
+    out null, 6      [0] side 0 ; shift 6 zeroes into OSR
+    mov pins, isr    [1] side 1 ; col 2 & clock posedge
+
+    in osr, 6        [0] side 0 ;
+    out null, 6      [0] side 0 ; shift 6 zeroes into OSR
+    mov pins, isr    [1] side 1 ; col 3 & clock posedge
+.wrap
+
+; Note that because the clock edge for pixel n is in the middle of pixel n +
+; 1, a dummy pixel at the end is required to clock the last piece of genuine
+; data. (Also 1 pixel of garbage is clocked out at the start, but this is
+; harmless)
+
+% c-sdk {
+static inline void hub75_data_rgb888_program_init(PIO pio, uint sm, uint offset, uint rgb_base_pin, uint clock_pin) {
+    pio_sm_set_consecutive_pindirs(pio, sm, rgb_base_pin, 6, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, clock_pin, 1, true);
+    for (uint i = rgb_base_pin; i < rgb_base_pin + 6; ++i)
+        pio_gpio_init(pio, i);
+    pio_gpio_init(pio, clock_pin);
+
+    pio_sm_config c = hub75_data_rgb888_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, rgb_base_pin, 6);
+    sm_config_set_sideset_pins(&c, clock_pin);
+    // OSR shifts right; when we do `out null, 6` the effect on OSR is `OSR = OSR >> 6`
+
+    sm_config_set_out_shift(&c, true, false, 32);
+
+    // ISR shift to left. every `in osr, 6` ends at `OSR = 0b.....dddddd` (d = data)
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_exec(pio, sm, offset + hub75_data_rgb888_offset_entry_point);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}
